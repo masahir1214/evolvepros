@@ -1,14 +1,19 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { COOKIE_NAME } from "@shared/const";
+import { COOKIE_NAME, PASSWORD_MIN_LENGTH } from "@shared/const";
 import type { Lead } from "../drizzle/schema";
-import { makeRequest } from "./_core/map";
+import { ENV } from "./_core/env";
+import { hashPassword, verifyAgainstDummy, verifyPassword } from "./_core/password";
+import { checkRateLimit, clearRateLimit, consumeRateLimit, recordFailure } from "./_core/rateLimit";
+import { createSessionToken, isSessionConfigured, SESSION_MAX_AGE_MS } from "./_core/session";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
-import { adminProcedure, publicProcedure, router } from "./_core/trpc";
-import { getDb } from "./db";
+import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { getDb, getUserByEmail, touchLastSignedIn } from "./db";
+import { searchPlaces } from "./places";
+import { createPasswordResetToken, deliverPasswordReset, resetPasswordWithToken } from "./password-reset";
 import { users, workspaceAdmins } from "../drizzle/schema";
 import {
   getProviderStatus,
@@ -31,31 +36,6 @@ import {
 } from "./lead-service";
 import { generateEmail, googleSearch, syncLead, verifyEmail, verifyPhone } from "./provider-service";
 import { findSocialLinks } from "./website-enrichment";
-
-const mapsResultSchema = z.object({
-  status: z.string().optional(),
-  results: z.array(z.object({
-    place_id: z.string().optional(),
-    name: z.string().optional(),
-    formatted_address: z.string().optional(),
-    rating: z.number().optional(),
-    user_ratings_total: z.number().optional(),
-  })).optional(),
-});
-
-const mapDetailsSchema = z.object({
-  status: z.string().optional(),
-  result: z.object({
-    place_id: z.string().optional(),
-    name: z.string().optional(),
-    formatted_address: z.string().optional(),
-    international_phone_number: z.string().optional(),
-    formatted_phone_number: z.string().optional(),
-    website: z.string().optional(),
-    rating: z.number().optional(),
-    user_ratings_total: z.number().optional(),
-  }).optional(),
-});
 
 const providerSchema = z.enum(providers);
 const credentialFields: Record<Provider, string[]> = {
@@ -83,109 +63,167 @@ function requireVerifiedBusinessDetails(lead: Lead): void {
   }
 }
 
+// Everyone shares the administrator's provider keys (Maps, OpenAI, ZeroBounce, Twilio), so
+// regular accounts get an hourly allowance of provider-backed actions to cap anyone's spend.
+const PROVIDER_CALLS_PER_HOUR = 60;
+function enforceProviderQuota(user: { id: number; role: string }) {
+  if (user.role === "admin") return;
+  const result = consumeRateLimit(`provider:${user.id}`, PROVIDER_CALLS_PER_HOUR, 60 * 60 * 1000);
+  if (!result.allowed) {
+    throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: `You have reached the hourly limit for searches and verifications. Try again in ${Math.ceil(result.retryAfterSec / 60)} minute(s).` });
+  }
+}
+
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query((opts) => opts.ctx.user),
+    me: publicProcedure.query((opts) => opts.ctx.user ? { id: opts.ctx.user.id, name: opts.ctx.user.name, email: opts.ctx.user.email, role: opts.ctx.user.role } : null),
+    setupStatus: publicProcedure.query(async () => {
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database is not available. Check DATABASE_URL." });
+      const [owner] = await db.select().from(workspaceAdmins).where(eq(workspaceAdmins.slot, "owner")).limit(1);
+      return { setupRequired: !owner, tokenConfigured: Boolean(ENV.adminBootstrapToken), sessionConfigured: isSessionConfigured(), signupOpen: ENV.signupOpen };
+    }),
+    // One-time creation of the first (and only initial) administrator, protected by APP_ADMIN_BOOTSTRAP_TOKEN.
+    setup: publicProcedure.input(z.object({
+      name: z.string().trim().min(1).max(120),
+      email: z.string().trim().toLowerCase().email().max(320),
+      password: z.string().min(PASSWORD_MIN_LENGTH).max(200),
+      token: z.string().min(16).max(512),
+    })).mutation(async ({ ctx, input }) => {
+      const limitKey = `setup:${ctx.req.ip}`;
+      const limit = checkRateLimit(limitKey, 10, 15 * 60 * 1000);
+      if (!limit.allowed) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: `Too many attempts. Try again in ${limit.retryAfterSec} seconds.` });
+      if (!isSessionConfigured()) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "SESSION_SECRET is not configured on the server." });
+      const expected = Buffer.from(ENV.adminBootstrapToken, "utf8");
+      const supplied = Buffer.from(input.token, "utf8");
+      if (!expected.length || expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) {
+        recordFailure(limitKey);
+        throw new TRPCError({ code: "FORBIDDEN", message: "That setup key is not valid." });
+      }
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database is not available. Check DATABASE_URL." });
+      const passwordHash = await hashPassword(input.password);
+      const openId = `local_${randomUUID()}`;
+      try {
+        await db.transaction(async (tx) => {
+          const [owner] = await tx.select().from(workspaceAdmins).where(eq(workspaceAdmins.slot, "owner")).limit(1);
+          if (owner) throw new TRPCError({ code: "CONFLICT", message: "Workspace ownership has already been claimed. Sign in instead." });
+          await tx.insert(users).values({ openId, email: input.email, name: input.name, passwordHash, loginMethod: "email", role: "admin" });
+          await tx.insert(workspaceAdmins).values({ slot: "owner", openId });
+        });
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        throw new TRPCError({ code: "CONFLICT", message: "The owner account could not be created. It may already have been claimed." });
+      }
+      const token = await createSessionToken(openId);
+      ctx.res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(ctx.req), maxAge: SESSION_MAX_AGE_MS });
+      return { success: true as const };
+    }),
+    login: publicProcedure.input(z.object({
+      email: z.string().trim().toLowerCase().email().max(320),
+      password: z.string().min(1).max(200),
+    })).mutation(async ({ ctx, input }) => {
+      const limitKey = `login:${ctx.req.ip}:${input.email}`;
+      const limit = checkRateLimit(limitKey, 8, 15 * 60 * 1000);
+      if (!limit.allowed) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: `Too many failed attempts. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minute(s).` });
+      if (!isSessionConfigured()) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "SESSION_SECRET is not configured on the server." });
+      const user = await getUserByEmail(input.email);
+      let valid = false;
+      if (user) valid = await verifyPassword(input.password, user.passwordHash);
+      else await verifyAgainstDummy(input.password);
+      if (!user || !valid) {
+        recordFailure(limitKey);
+        throw new TRPCError({ code: "UNAUTHORIZED", message: "Incorrect email or password." });
+      }
+      clearRateLimit(limitKey);
+      await touchLastSignedIn(user.id);
+      const token = await createSessionToken(user.openId);
+      ctx.res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(ctx.req), maxAge: SESSION_MAX_AGE_MS });
+      return { success: true as const };
+    }),
+    register: publicProcedure.input(z.object({
+      name: z.string().trim().min(1).max(120),
+      email: z.string().trim().toLowerCase().email().max(320),
+      password: z.string().min(PASSWORD_MIN_LENGTH).max(200),
+    })).mutation(async ({ ctx, input }) => {
+      if (!ENV.signupOpen) throw new TRPCError({ code: "FORBIDDEN", message: "New sign-ups are closed. Ask the administrator for an account." });
+      const limit = consumeRateLimit(`register:${ctx.req.ip}`, 5, 60 * 60 * 1000);
+      if (!limit.allowed) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: `Too many accounts created from this network. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minute(s).` });
+      if (!isSessionConfigured()) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "SESSION_SECRET is not configured on the server." });
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database is not available. Check DATABASE_URL." });
+      const [owner] = await db.select().from(workspaceAdmins).where(eq(workspaceAdmins.slot, "owner")).limit(1);
+      if (!owner) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "The workspace is not set up yet. The administrator must create the first account." });
+      const taken = new TRPCError({ code: "CONFLICT", message: "An account with this email already exists. Sign in or reset your password." });
+      if (await getUserByEmail(input.email)) throw taken;
+      const passwordHash = await hashPassword(input.password);
+      const openId = `local_${randomUUID()}`;
+      try {
+        await db.insert(users).values({ openId, email: input.email, name: input.name, passwordHash, loginMethod: "email", role: "user" });
+      } catch (error) {
+        if (await getUserByEmail(input.email)) throw taken;
+        throw error;
+      }
+      const token = await createSessionToken(openId);
+      ctx.res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(ctx.req), maxAge: SESSION_MAX_AGE_MS });
+      return { success: true as const };
+    }),
+    // Always answers the same way, so it cannot be used to discover which emails have accounts.
+    requestPasswordReset: publicProcedure.input(z.object({
+      email: z.string().trim().toLowerCase().email().max(320),
+    })).mutation(async ({ ctx, input }) => {
+      const byIp = consumeRateLimit(`reset-ip:${ctx.req.ip}`, 10, 60 * 60 * 1000);
+      const byEmail = consumeRateLimit(`reset-email:${input.email}`, 3, 60 * 60 * 1000);
+      if (!byIp.allowed || !byEmail.allowed) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Too many reset requests. Try again in a little while." });
+      const user = await getUserByEmail(input.email);
+      if (user) {
+        const token = await createPasswordResetToken(user.id);
+        void deliverPasswordReset(user.email, token).catch((error) => console.error("[reset] Could not send the reset email:", error instanceof Error ? error.message : error));
+      }
+      return { success: true as const };
+    }),
+    resetPassword: publicProcedure.input(z.object({
+      token: z.string().min(20).max(200),
+      password: z.string().min(PASSWORD_MIN_LENGTH).max(200),
+    })).mutation(async ({ ctx, input }) => {
+      const limit = consumeRateLimit(`reset-use:${ctx.req.ip}`, 10, 15 * 60 * 1000);
+      if (!limit.allowed) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Too many attempts. Try again in a few minutes." });
+      const ok = await resetPasswordWithToken(input.token, input.password);
+      if (!ok) throw new TRPCError({ code: "BAD_REQUEST", message: "This reset link is invalid or has expired. Request a new one." });
+      return { success: true as const };
+    }),
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
       return { success: true } as const;
     }),
   }),
-  adminBootstrap: router({
-    status: publicProcedure.query(async ({ ctx }) => {
-      if (!ctx.user) throw new TRPCError({ code: "UNAUTHORIZED", message: "Sign in to continue." });
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database is not available." });
-      const [owner] = await db.select().from(workspaceAdmins).where(eq(workspaceAdmins.slot, "owner")).limit(1);
-      return { claimAvailable: !owner, tokenConfigured: Boolean(process.env.APP_ADMIN_BOOTSTRAP_TOKEN) };
-    }),
-    claim: publicProcedure.input(z.object({ token: z.string().min(16).max(512) })).mutation(async ({ ctx, input }) => {
-      if (!ctx.user) throw new TRPCError({ code: "UNAUTHORIZED", message: "Sign in to continue." });
-      const openId = ctx.user.openId;
-      const expected = Buffer.from(process.env.APP_ADMIN_BOOTSTRAP_TOKEN ?? "", "utf8");
-      const supplied = Buffer.from(input.token, "utf8");
-      if (!expected.length || expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "That setup key is not valid." });
-      }
-      const db = await getDb();
-      if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database is not available." });
-      try {
-        await db.transaction(async (tx) => {
-          const [owner] = await tx.select().from(workspaceAdmins).where(eq(workspaceAdmins.slot, "owner")).limit(1);
-          if (owner) throw new TRPCError({ code: "CONFLICT", message: "Workspace ownership has already been claimed." });
-          const [admin] = await tx.select().from(users).where(eq(users.role, "admin")).limit(1);
-          if (admin) throw new TRPCError({ code: "CONFLICT", message: "An administrator already exists." });
-          await tx.insert(workspaceAdmins).values({ slot: "owner", openId });
-          await tx.update(users).set({ role: "admin" }).where(eq(users.openId, openId));
-        });
-        return { success: true };
-      } catch (error) {
-        if (error instanceof TRPCError) throw error;
-        throw new TRPCError({ code: "CONFLICT", message: "The owner claim could not be completed. Another account may have claimed the workspace first." });
-      }
-    }),
-  }),
 
   search: router({
-    maps: adminProcedure.input(z.object({ query: z.string().min(2).max(120), location: z.string().min(2).max(160) })).query(async ({ input, ctx }) => {
+    maps: protectedProcedure.input(z.object({ query: z.string().min(2).max(120), location: z.string().min(2).max(160) })).query(async ({ input, ctx }) => {
       ctx.res.setHeader("Cache-Control", "private, no-store");
-      try {
-        const searchResult = mapsResultSchema.parse(await makeRequest("/maps/api/place/textsearch/json", {
-          query: `${input.query} healthcare practice ${input.location}`,
-        }));
-        if (searchResult.status === "ZERO_RESULTS") return [];
-        if (searchResult.status && searchResult.status !== "OK") throw new Error(`Google Maps returned ${searchResult.status}.`);
-        const places = (searchResult.results ?? []).slice(0, 10);
-        const results = await Promise.all(places.map(async (place) => {
-          if (!place.place_id) return null;
-          let detail: z.infer<typeof mapDetailsSchema>["result"];
-          try {
-            const details = mapDetailsSchema.parse(await makeRequest("/maps/api/place/details/json", {
-              place_id: place.place_id,
-              fields: "place_id,name,formatted_address,international_phone_number,formatted_phone_number,website,rating,user_ratings_total",
-            }));
-            detail = details.result;
-          } catch {
-            detail = undefined;
-          }
-          const name = detail?.name ?? place.name;
-          if (!name) return null;
-          return {
-            source: "google_maps" as const,
-            sourceId: detail?.place_id ?? place.place_id,
-            sourceUrl: `https://www.google.com/maps/search/?api=1&query_place_id=${encodeURIComponent(place.place_id)}`,
-            name,
-            specialty: input.query,
-            address: detail?.formatted_address ?? place.formatted_address,
-            city: input.location,
-            country: "United States",
-            website: detail?.website,
-            phone: detail?.international_phone_number ?? detail?.formatted_phone_number,
-            rating: detail?.rating ?? place.rating,
-            reviewCount: detail?.user_ratings_total ?? place.user_ratings_total,
-          };
-        }));
-        return results.filter(Boolean);
-      } catch (error) { return safeProviderError(error); }
+      enforceProviderQuota(ctx.user);
+      try { return await searchPlaces(input.query, input.location); }
+      catch (error) { return safeProviderError(error); }
     }),
-    google: adminProcedure.input(z.object({ query: z.string().min(2).max(120), location: z.string().min(2).max(160) })).query(async ({ input, ctx }) => {
+    google: protectedProcedure.input(z.object({ query: z.string().min(2).max(120), location: z.string().min(2).max(160) })).query(async ({ input, ctx }) => {
       ctx.res.setHeader("Cache-Control", "private, no-store");
+      enforceProviderQuota(ctx.user);
       try { return await googleSearch(input.query, input.location); }
       catch (error) { return safeProviderError(error); }
     }),
   }),
 
   leads: router({
-    list: adminProcedure.query(async () => listLeads()),
-    delete: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    list: protectedProcedure.query(async ({ ctx }) => listLeads(ctx.user.id)),
+    delete: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input, ctx }) => {
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
-      await deleteLead(lead.id);
+      await deleteLead(lead.id, ctx.user.id);
       return { success: true };
     }),
-    saveCandidates: adminProcedure.input(z.object({ candidates: z.array(z.object({
+    saveCandidates: protectedProcedure.input(z.object({ candidates: z.array(z.object({
       source: z.enum(["google_maps", "google_search"]),
       sourceId: z.string().max(255).optional(),
       sourceUrl: z.string().max(2048).optional(),
@@ -198,8 +236,8 @@ export const appRouter = router({
       phone: z.string().max(80).optional(),
       rating: z.number().optional(),
       reviewCount: z.number().int().nonnegative().optional(),
-    })).min(1).max(50) })).mutation(async ({ input }) => saveCandidates(input.candidates)),
-    createVerified: adminProcedure.input(z.object({
+    })).min(1).max(50) })).mutation(async ({ input, ctx }) => saveCandidates(ctx.user.id, input.candidates)),
+    createVerified: protectedProcedure.input(z.object({
       name: z.string().trim().min(1).max(255),
       specialty: z.string().trim().max(160).optional(),
       address: z.string().trim().max(2000).optional(),
@@ -211,11 +249,11 @@ export const appRouter = router({
       phone: z.string().trim().max(80).optional(),
       googlePlaceId: z.string().trim().min(1).max(255).optional(),
       confirmedFromBusinessWebsite: z.literal(true),
-    })).mutation(async ({ input }) => {
+    })).mutation(async ({ input, ctx }) => {
       const { confirmedFromBusinessWebsite: _confirmed, ...details } = input;
-      return createVerifiedLead(details);
+      return createVerifiedLead(ctx.user.id, details);
     }),
-    updateContact: adminProcedure.input(z.object({
+    updateContact: protectedProcedure.input(z.object({
       id: z.number().int().positive(),
       name: z.string().trim().min(1).max(255),
       email: z.string().trim().email().max(320).or(z.literal("")),
@@ -227,11 +265,11 @@ export const appRouter = router({
       state: z.string().trim().max(120).optional(),
       country: z.string().trim().max(100).optional(),
       confirmedFromBusinessWebsite: z.literal(true),
-    })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    })).mutation(async ({ input, ctx }) => {
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       const patch = input;
-      await updateLead(lead.id, {
+      await updateLead(lead.id, ctx.user.id, {
         name: patch.name,
         source: "manual",
         sourceUrl: patch.website,
@@ -249,41 +287,45 @@ export const appRouter = router({
       });
       return { success: true };
     }),
-    findSocials: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    findSocials: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input, ctx }) => {
+      enforceProviderQuota(ctx.user);
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       requireVerifiedBusinessDetails(lead);
       if (!lead.website) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Add a business website before looking for social links." });
       try {
         const socials = await findSocialLinks(lead.website);
-        await updateLead(lead.id, { ...socials, enrichmentStatus: Object.values(socials).some(Boolean) ? "complete" : "partial", lastEnrichedAt: new Date() });
+        await updateLead(lead.id, ctx.user.id, { ...socials, enrichmentStatus: Object.values(socials).some(Boolean) ? "complete" : "partial", lastEnrichedAt: new Date() });
         return socials;
       } catch (error) { return safeProviderError(error); }
     }),
-    verifyEmail: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    verifyEmail: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input, ctx }) => {
+      enforceProviderQuota(ctx.user);
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       requireVerifiedBusinessDetails(lead);
       if (!lead.email) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Add a business email before verification." });
       try {
         const result = await verifyEmail(lead.email);
-        await updateLead(lead.id, { emailStatus: result.status, lastEnrichedAt: new Date() });
+        await updateLead(lead.id, ctx.user.id, { emailStatus: result.status, lastEnrichedAt: new Date() });
         return result;
       } catch (error) { return safeProviderError(error); }
     }),
-    verifyPhone: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    verifyPhone: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input, ctx }) => {
+      enforceProviderQuota(ctx.user);
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       requireVerifiedBusinessDetails(lead);
       if (!lead.phone) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Add a business phone before verification." });
       try {
         const result = await verifyPhone(lead.phone);
-        await updateLead(lead.id, { phoneStatus: result.status, lastEnrichedAt: new Date() });
+        await updateLead(lead.id, ctx.user.id, { phoneStatus: result.status, lastEnrichedAt: new Date() });
         return result;
       } catch (error) { return safeProviderError(error); }
     }),
-    generateDraft: adminProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    generateDraft: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input, ctx }) => {
+      enforceProviderQuota(ctx.user);
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       requireVerifiedBusinessDetails(lead);
       try {
@@ -292,8 +334,8 @@ export const appRouter = router({
         return { id: draftId, ...generated };
       } catch (error) { return safeProviderError(error); }
     }),
-    syncCrm: adminProcedure.input(z.object({ id: z.number().int().positive(), provider: z.enum(["hubspot", "zoho"]) })).mutation(async ({ input }) => {
-      const lead = await getLead(input.id);
+    syncCrm: adminProcedure.input(z.object({ id: z.number().int().positive(), provider: z.enum(["hubspot", "zoho"]) })).mutation(async ({ input, ctx }) => {
+      const lead = await getLead(input.id, ctx.user.id);
       if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found." });
       requireVerifiedBusinessDetails(lead);
       try {
@@ -301,7 +343,7 @@ export const appRouter = router({
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse(lead.crmSyncStatus ?? "{}"); } catch {}
         const next = { ...previous, [input.provider]: { status: "synced", externalId: result.id, syncedAt: new Date().toISOString() } };
-        await updateLead(lead.id, { crmSyncStatus: JSON.stringify(next), outreachStatus: "synced" });
+        await updateLead(lead.id, ctx.user.id, { crmSyncStatus: JSON.stringify(next), outreachStatus: "synced" });
         return { success: true, externalId: result.id };
       } catch (error) {
         let previous: Record<string, unknown> = {};
@@ -309,22 +351,23 @@ export const appRouter = router({
         const message = error instanceof Error ? error.message.slice(0, 400) : "The provider request failed.";
         const prior = (previous[input.provider] ?? {}) as Record<string, unknown>;
         const next = { ...previous, [input.provider]: { ...prior, status: "error", error: message, attemptedAt: new Date().toISOString() } };
-        await updateLead(lead.id, { crmSyncStatus: JSON.stringify(next) });
+        await updateLead(lead.id, ctx.user.id, { crmSyncStatus: JSON.stringify(next) });
         return safeProviderError(error);
       }
     }),
   }),
 
   drafts: router({
-    list: adminProcedure.query(async () => listDrafts()),
-    update: adminProcedure.input(z.object({ id: z.number().int().positive(), subject: z.string().min(1).max(500), body: z.string().min(1).max(12000) })).mutation(async ({ input }) => {
-      await updateDraft(input.id, input.subject, input.body);
+    list: protectedProcedure.query(async ({ ctx }) => listDrafts(ctx.user.id)),
+    update: protectedProcedure.input(z.object({ id: z.number().int().positive(), subject: z.string().min(1).max(500), body: z.string().min(1).max(12000) })).mutation(async ({ input, ctx }) => {
+      const updated = await updateDraft(input.id, ctx.user.id, input.subject, input.body);
+      if (!updated) throw new TRPCError({ code: "NOT_FOUND", message: "Draft not found." });
       return { success: true };
     }),
   }),
 
   settings: router({
-    status: adminProcedure.query(async () => ({ providers: await getProviderStatus(), encryptionReady: isEncryptionConfigured() })),
+    status: protectedProcedure.query(async () => ({ providers: await getProviderStatus(), encryptionReady: isEncryptionConfigured() })),
     saveCredentials: adminProcedure.input(z.object({ provider: providerSchema, credentials: z.record(z.string(), z.string().max(8192)) })).mutation(async ({ input }) => {
       let required = credentialFields[input.provider];
       if (input.provider === "googleSearch") {

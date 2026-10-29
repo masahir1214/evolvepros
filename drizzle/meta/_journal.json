@@ -1,19 +1,19 @@
 {
   "version": "7",
-  "dialect": "mysql",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "5",
-      "when": 1788785580464,
-      "tag": "0000_initial_users",
+      "version": "7",
+      "when": 1792918780721,
+      "tag": "0000_init",
       "breakpoints": true
     },
     {
       "idx": 1,
-      "version": "5",
-      "when": 1792914444112,
-      "tag": "0001_evolve_prospecting_workspace",
+      "version": "7",
+      "when": 1793256542610,
+      "tag": "0001_accounts_and_ownership",
       "breakpoints": true
     }
   ]

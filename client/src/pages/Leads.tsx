@@ -1,3 +1,4 @@
+import { useAuth } from "@/_core/hooks/useAuth";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { ArrowDownToLine, ArrowRight, BadgeCheck, Building2, ExternalLink, FileSpreadsheet, Globe2, Mail, MapPin, Phone, Search, ShieldCheck, Sparkles, Trash2, Users, X } from "lucide-react";
@@ -58,6 +59,7 @@ function LeadDetail({ lead, onClose, onDeleted }: { lead: Lead; onClose: () => v
   const verifyPhone = trpc.leads.verifyPhone.useMutation({ onSuccess: async (result) => { toast.success(`Phone status: ${result.status}. ${result.detail}`); await utils.leads.list.invalidate(); }, onError: (error) => toast.error(error.message) });
   const socials = trpc.leads.findSocials.useMutation({ onSuccess: async (result) => { toast.success(Object.values(result).some(Boolean) ? "Public social links found." : "No social profile links were found on that website."); await utils.leads.list.invalidate(); }, onError: (error) => toast.error(error.message) });
   const draft = trpc.leads.generateDraft.useMutation({ onSuccess: async () => { toast.success("Editable email draft created."); await utils.leads.list.invalidate(); }, onError: (error) => toast.error(error.message) });
+  const isAdmin = useAuth().user?.role === "admin";
   const sync = trpc.leads.syncCrm.useMutation({ onSuccess: async (result) => { toast.success(`CRM record synced (${result.externalId}).`); await utils.leads.list.invalidate(); }, onError: (error) => toast.error(error.message) });
   const remove = trpc.leads.delete.useMutation({ onSuccess: async () => { toast.success("Lead and linked drafts deleted."); await utils.leads.list.invalidate(); onDeleted(); }, onError: (error) => toast.error(error.message) });
   const syncInfo = (() => { try { return JSON.parse(lead.crmSyncStatus ?? "{}"); } catch { return {}; } })() as Record<string, { status?: string; externalId?: string; syncedAt?: string; error?: string; attemptedAt?: string }>;
@@ -103,8 +105,8 @@ function LeadDetail({ lead, onClose, onDeleted }: { lead: Lead; onClose: () => v
     </div></div>
     <div className="detail-section"><div className="detail-label">Outreach and CRM</div><div className="detail-actions" style={{ marginTop: 0 }}>
       <button className="button button-primary button-small" onClick={() => draft.mutate({ id: lead.id })} disabled={locked || draft.isPending}><Sparkles />Create email draft</button>
-      <button className="button button-outline button-small" onClick={() => sync.mutate({ id: lead.id, provider: "hubspot" })} disabled={locked || sync.isPending}><Building2 />{syncInfo.hubspot?.status === "synced" ? "Sync HubSpot again" : "HubSpot"}</button>
-      <button className="button button-outline button-small" onClick={() => sync.mutate({ id: lead.id, provider: "zoho" })} disabled={locked || sync.isPending}><ArrowDownToLine />{syncInfo.zoho?.status === "synced" ? "Sync Zoho again" : "Zoho CRM"}</button>
+      {isAdmin && <button className="button button-outline button-small" onClick={() => sync.mutate({ id: lead.id, provider: "hubspot" })} disabled={locked || sync.isPending}><Building2 />{syncInfo.hubspot?.status === "synced" ? "Sync HubSpot again" : "HubSpot"}</button>}
+      {isAdmin && <button className="button button-outline button-small" onClick={() => sync.mutate({ id: lead.id, provider: "zoho" })} disabled={locked || sync.isPending}><ArrowDownToLine />{syncInfo.zoho?.status === "synced" ? "Sync Zoho again" : "Zoho CRM"}</button>}
     </div><p className="source-note" style={{ margin: "9px 0 0" }}>{locked ? "Confirm official-website details before using AI or CRM sync." : `${syncInfo.hubspot?.status === "synced" ? `HubSpot synced ${new Date(syncInfo.hubspot.syncedAt ?? "").toLocaleDateString()}. ` : syncInfo.hubspot?.status === "error" ? `HubSpot error: ${syncInfo.hubspot.error}. ` : ""}${syncInfo.zoho?.status === "synced" ? `Zoho synced ${new Date(syncInfo.zoho.syncedAt ?? "").toLocaleDateString()}.` : syncInfo.zoho?.status === "error" ? `Zoho error: ${syncInfo.zoho.error}.` : ""}`}</p></div>
     <div className="detail-section"><button className="button button-danger button-small" type="button" onClick={() => { if (window.confirm(`Delete ${lead.name} and its linked drafts? This cannot be undone.`)) remove.mutate({ id: lead.id }); }} disabled={remove.isPending}><Trash2 />{remove.isPending ? "Deleting…" : "Delete lead and drafts"}</button></div>
   </aside>;

@@ -28,21 +28,30 @@ export async function createSessionToken(openId: string): Promise<string> {
     .sign(secretKey());
 }
 
-export async function verifySessionToken(token: string | undefined | null): Promise<string | null> {
+export async function readSession(token: string | undefined | null): Promise<{ openId: string; issuedAt: number } | null> {
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, secretKey(), { algorithms: ["HS256"] });
-    return typeof payload.openId === "string" && payload.openId ? payload.openId : null;
+    if (typeof payload.openId !== "string" || !payload.openId) return null;
+    return { openId: payload.openId, issuedAt: typeof payload.iat === "number" ? payload.iat : 0 };
   } catch {
     return null;
   }
 }
 
+export async function verifySessionToken(token: string | undefined | null): Promise<string | null> {
+  return (await readSession(token))?.openId ?? null;
+}
+
 // Resolves the signed-in user from the session cookie, or null when signed out.
 export async function authenticateRequest(req: Request): Promise<User | null> {
   const token = parseCookieHeader(req.headers.cookie ?? "")[COOKIE_NAME];
-  const openId = await verifySessionToken(token);
-  if (!openId) return null;
-  return (await db.getUserByOpenId(openId)) ?? null;
+  const session = await readSession(token);
+  if (!session) return null;
+  const user = await db.getUserByOpenId(session.openId);
+  if (!user) return null;
+  // A password change or reset signs out every session issued before it.
+  if (user.passwordChangedAt && Math.floor(user.passwordChangedAt.getTime() / 1000) > session.issuedAt) return null;
+  return user;
 }
 

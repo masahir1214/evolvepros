@@ -1,3 +1,4 @@
+import { useAuth } from "@/_core/hooks/useAuth";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { ArrowDownToLine, ArrowRight, ArrowUpRight, Check, ExternalLink, Globe2, MapPin, Search as SearchIcon, Star } from "lucide-react";
@@ -22,6 +23,7 @@ const emptyCapture: CaptureForm = { name: "", specialty: "", address: "", city: 
 
 export default function Search() {
   const [_, setLocation] = useLocation();
+  const isAdmin = useAuth().user?.role === "admin";
   const [query, setQuery] = useState("Pain management");
   const [location, setLocationValue] = useState("Phoenix, AZ");
   const [source, setSource] = useState<"maps" | "google">("maps");
@@ -101,7 +103,7 @@ export default function Search() {
   return <>
     <div className="page-heading">
       <div><div className="eyebrow"><span className="eyebrow-mark" />Market discovery</div><h2>Search for a good-fit practice.</h2><p>Find healthcare practice listings, then confirm business details from the practice's own website before saving a usable lead.</p></div>
-      <button className="button button-outline" onClick={() => setLocation("/settings")}>Provider setup <ArrowRight /></button>
+      {isAdmin && <button className="button button-outline" onClick={() => setLocation("/settings")}>Provider setup <ArrowRight /></button>}
     </div>
     <section className="panel panel-inset" style={{ marginBottom: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 14, flexWrap: "wrap", alignItems: "center", marginBottom: 15 }}>

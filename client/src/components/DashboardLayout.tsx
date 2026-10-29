@@ -1,7 +1,6 @@
 import { useAuth } from "@/_core/hooks/useAuth";
-import { startLogin } from "@/const";
 import { Button } from "@/components/ui/button";
-import AdminSetup from "@/pages/AdminSetup";
+import AuthScreen from "@/pages/AuthScreen";
 import { ArrowUpRight, BarChart3, ChevronRight, CircleHelp, Database, FileText, LayoutDashboard, LogOut, Menu, Plug, Search, Settings, ShieldCheck, Users, X } from "lucide-react";
 import { useState } from "react";
 import { useLocation } from "wouter";
@@ -30,20 +29,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const current = pageInfo[location] ?? pageInfo["/"];
 
   if (loading) return <div className="login-screen"><div className="loading-line">Opening your secure workspace…</div></div>;
-  if (!user) return (
-    <div className="login-screen">
-      <div className="panel login-card">
-        <div className="brand-logo-frame"><img src="/evolve-healthcare-logo.png" alt="Evolve Healthcare Marketing" /></div>
-        <div className="eyebrow" style={{ justifyContent: "center" }}><span className="eyebrow-mark" /> Practice intelligence</div>
-        <h1>Lead with better context.</h1>
-        <p>Sign in to preview this independent Evolve practice-prospecting concept. Workspace access is restricted to its administrator.</p>
-        <Button className="button button-primary" style={{ width: "100%" }} onClick={() => startLogin()}>Sign in securely <ArrowUpRight /></Button>
-        <p className="source-note" style={{ marginTop: 16 }}>Independent concept demo · not an official Evolve Results product or endorsement.</p>
-        <nav className="sidebar-policy-links" style={{ justifyContent: "center", marginTop: 8 }} aria-label="Public policies"><a href="/terms">Terms</a><a href="/privacy">Privacy</a></nav>
-      </div>
-    </div>
-  );
-  if (user.role !== "admin") return <AdminSetup name={user.name} email={user.email} onSignOut={() => void logout()} />;
+  if (!user) return <AuthScreen />;
+  const isAdmin = user.role === "admin";
+  const visibleNav = navItems.filter((item) => isAdmin || item.path !== "/settings");
 
   return (
     <div className="app-shell">
@@ -56,7 +44,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         </div>
         <div className="side-label">Workspace</div>
         <nav className="side-nav" aria-label="Main navigation">
-          {navItems.map((item) => {
+          {visibleNav.map((item) => {
             const active = location === item.path;
             const Icon = item.icon;
             return <button key={item.path} className={`nav-item ${active ? "active" : ""}`} onClick={() => { setLocation(item.path); setMobileOpen(false); }}>
@@ -72,7 +60,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           <nav className="sidebar-policy-links" aria-label="Public policies"><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="https://ehmresults.com/" target="_blank" rel="noreferrer">Evolve Results site ↗</a></nav>
           <div className="user-card">
             <div className="user-avatar">{(user.name || user.email || "E").charAt(0).toUpperCase()}</div>
-            <div className="user-meta"><strong>{user.name || "Evolve admin"}</strong><span>{user.email || "Workspace administrator"}</span></div>
+            <div className="user-meta"><strong>{user.name || (isAdmin ? "Evolve admin" : "Your account")}</strong><span>{user.email}</span></div>
             <button className="logout-btn" title="Sign out" aria-label="Sign out" onClick={() => void logout()}><LogOut size={15} /></button>
           </div>
         </div>
@@ -84,7 +72,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <div><h1>{current.title}</h1><p>{current.subtitle}</p></div>
           </div>
           <div className="topbar-right">
-            <div className="topbar-tag"><ShieldCheck size={14} color="#7cff6b" /> Admin-only data</div>
+            <div className="topbar-tag"><ShieldCheck size={14} color="#7cff6b" /> {isAdmin ? "Administrator" : "Private to your account"}</div>
             <div className="topbar-tag"><BarChart3 size={14} /> Independent demo</div>
           </div>
         </header>

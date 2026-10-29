@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { InsertLead, Lead } from "../drizzle/schema";
 import { drafts, leads } from "../drizzle/schema";
 import { getDb } from "./db";
@@ -57,29 +57,29 @@ export function sanitizeCandidateForStorage(candidate: SearchCandidate): SearchC
   return candidate;
 }
 
-export async function listLeads(): Promise<Lead[]> {
+export async function listLeads(ownerId: number): Promise<Lead[]> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  return db.select().from(leads).orderBy(desc(leads.updatedAt)).limit(500);
+  return db.select().from(leads).where(eq(leads.ownerId, ownerId)).orderBy(desc(leads.updatedAt)).limit(500);
 }
 
-export async function getLead(id: number): Promise<Lead | undefined> {
+export async function getLead(id: number, ownerId: number): Promise<Lead | undefined> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  const [lead] = await db.select().from(leads).where(eq(leads.id, id)).limit(1);
+  const [lead] = await db.select().from(leads).where(and(eq(leads.id, id), eq(leads.ownerId, ownerId))).limit(1);
   return lead;
 }
 
-export async function deleteLead(id: number): Promise<void> {
+export async function deleteLead(id: number, ownerId: number): Promise<void> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  await db.delete(leads).where(eq(leads.id, id));
+  await db.delete(leads).where(and(eq(leads.id, id), eq(leads.ownerId, ownerId)));
 }
 
-export async function saveCandidates(candidates: SearchCandidate[]): Promise<{ added: number; merged: number; leadIds: number[] }> {
+export async function saveCandidates(ownerId: number, candidates: SearchCandidate[]): Promise<{ added: number; merged: number; leadIds: number[] }> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  const existing = await listLeads();
+  const existing = await listLeads(ownerId);
   let added = 0;
   let merged = 0;
   const leadIds: number[] = [];
@@ -111,6 +111,7 @@ export async function saveCandidates(candidates: SearchCandidate[]): Promise<{ a
     }
     const isMapsReference = safeCandidate.source === "google_maps";
     const record: InsertLead = {
+      ownerId,
       source: safeCandidate.source,
       sourceId: safeCandidate.sourceId ?? null,
       sourceUrl: safeCandidate.sourceUrl ?? null,
@@ -127,11 +128,11 @@ export async function saveCandidates(candidates: SearchCandidate[]): Promise<{ a
       reviewCount: null,
       contactSourceVerified: !isMapsReference,
     };
-    const [created] = await db.insert(leads).values(record).$returningId();
+    const [created] = await db.insert(leads).values(record).returning({ id: leads.id });
     added += 1;
     leadIds.push(created.id);
     existing.unshift({
-      id: created.id, source: safeCandidate.source, sourceId: record.sourceId ?? null, sourceUrl: record.sourceUrl ?? null,
+      id: created.id, ownerId, source: safeCandidate.source, sourceId: record.sourceId ?? null, sourceUrl: record.sourceUrl ?? null,
       name: record.name, specialty: record.specialty ?? null, address: record.address ?? null,
       city: record.city ?? null, state: record.state ?? null, country: record.country ?? null, website: record.website ?? null,
       email: record.email ?? null, phone: record.phone ?? null, linkedin: null, instagram: null, facebook: null,
@@ -143,11 +144,11 @@ export async function saveCandidates(candidates: SearchCandidate[]): Promise<{ a
   return { added, merged, leadIds };
 }
 
-export async function createVerifiedLead(input: {
+export async function createVerifiedLead(ownerId: number, input: {
   name: string; specialty?: string; address?: string; city?: string; state?: string; country?: string;
   website: string; email?: string; phone?: string; googlePlaceId?: string;
 }): Promise<{ id: number; added: number; merged: number }> {
-  const result = await saveCandidates([{
+  const result = await saveCandidates(ownerId, [{
     source: "manual", sourceId: input.googlePlaceId, sourceUrl: input.website, name: input.name.trim(),
     specialty: input.specialty, address: input.address, city: input.city, state: input.state, country: input.country,
     website: input.website, email: input.email, phone: input.phone,
@@ -155,31 +156,36 @@ export async function createVerifiedLead(input: {
   return { id: result.leadIds[0], added: result.added, merged: result.merged };
 }
 
-export async function updateLead(id: number, patch: Partial<InsertLead>): Promise<void> {
+export async function updateLead(id: number, ownerId: number, patch: Partial<InsertLead>): Promise<void> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  await db.update(leads).set({ ...patch, updatedAt: new Date() }).where(eq(leads.id, id));
+  await db.update(leads).set({ ...patch, updatedAt: new Date() }).where(and(eq(leads.id, id), eq(leads.ownerId, ownerId)));
 }
 
 export async function saveDraft(input: { leadId: number; subject: string; body: string }): Promise<number> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  const [draft] = await db.insert(drafts).values(input).$returningId();
+  const [draft] = await db.insert(drafts).values(input).returning({ id: drafts.id });
   await db.update(leads).set({ outreachStatus: "drafted", updatedAt: new Date() }).where(eq(leads.id, input.leadId));
   return draft.id;
 }
 
-export async function listDrafts() {
+export async function listDrafts(ownerId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  const results = await db.select().from(drafts).orderBy(desc(drafts.updatedAt)).limit(300);
-  const allLeads = await listLeads();
-  const leadById = new Map(allLeads.map((lead) => [lead.id, lead]));
-  return results.map((draft) => ({ ...draft, lead: leadById.get(draft.leadId) ?? null }));
+  const rows = await db.select({ draft: drafts, lead: leads }).from(drafts)
+    .innerJoin(leads, eq(drafts.leadId, leads.id))
+    .where(eq(leads.ownerId, ownerId))
+    .orderBy(desc(drafts.updatedAt)).limit(300);
+  return rows.map(({ draft, lead }) => ({ ...draft, lead }));
 }
 
-export async function updateDraft(id: number, subject: string, body: string): Promise<void> {
+// Returns false when the draft does not exist or belongs to someone else.
+export async function updateDraft(id: number, ownerId: number, subject: string, body: string): Promise<boolean> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
-  await db.update(drafts).set({ subject, body, status: "edited", updatedAt: new Date() }).where(eq(drafts.id, id));
+  const mine = db.select({ id: leads.id }).from(leads).where(eq(leads.ownerId, ownerId));
+  const updated = await db.update(drafts).set({ subject, body, status: "edited", updatedAt: new Date() })
+    .where(and(eq(drafts.id, id), inArray(drafts.leadId, mine))).returning({ id: drafts.id });
+  return updated.length > 0;
 }

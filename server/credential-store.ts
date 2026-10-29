@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "./db";
+import { isMapsConfigured } from "./places";
 import { integrationSecrets } from "../drizzle/schema";
 
 export const providers = ["googleSearch", "openai", "zeroBounce", "twilio", "hubspot", "zoho"] as const;
@@ -50,7 +51,7 @@ export async function saveProviderCredentials(provider: Provider, credentials: P
   const db = await getDb();
   if (!db) throw new Error("Database is not available.");
   const encryptedValue = encrypt(JSON.stringify(credentials));
-  await db.insert(integrationSecrets).values({ provider, encryptedValue }).onDuplicateKeyUpdate({ set: { encryptedValue, updatedAt: new Date() } });
+  await db.insert(integrationSecrets).values({ provider, encryptedValue }).onConflictDoUpdate({ target: integrationSecrets.provider, set: { encryptedValue, updatedAt: new Date() } });
 }
 
 export async function removeProviderCredentials(provider: Provider): Promise<void> {
@@ -65,7 +66,7 @@ export async function getProviderStatus(): Promise<Record<Provider | "googleMaps
   const configured = await db.select({ provider: integrationSecrets.provider }).from(integrationSecrets);
   const saved = new Set(configured.map((item) => item.provider));
   return {
-    googleMaps: Boolean(process.env.MANUS_API_URL && process.env.MANUS_API_KEY),
+    googleMaps: isMapsConfigured(),
     googleSearch: saved.has("googleSearch"),
     openai: saved.has("openai"),
     zeroBounce: saved.has("zeroBounce"),

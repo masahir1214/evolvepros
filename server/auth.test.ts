@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hashPassword, verifyPassword } from "./_core/password";
-import { checkRateLimit, clearRateLimit, recordFailure } from "./_core/rateLimit";
-import { createSessionToken, verifySessionToken } from "./_core/session";
+import { checkRateLimit, clearRateLimit, consumeRateLimit, recordFailure } from "./_core/rateLimit";
+import { createSessionToken, readSession, verifySessionToken } from "./_core/session";
 import { getSessionCookieOptions } from "./_core/cookies";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -38,6 +38,18 @@ describe("session tokens", () => {
   });
 });
 
+describe("session issue time", () => {
+  it("exposes when the session was issued, so a password change can sign it out", async () => {
+    vi.stubEnv("SESSION_SECRET", "unit-test-signing-key-that-is-at-least-32-chars");
+    const before = Math.floor(Date.now() / 1000);
+    const session = await readSession(await createSessionToken("local_user-2"));
+    expect(session?.openId).toBe("local_user-2");
+    expect(session!.issuedAt).toBeGreaterThanOrEqual(before - 1);
+    expect(session!.issuedAt).toBeLessThanOrEqual(before + 2);
+    expect(await readSession("garbage")).toBeNull();
+  });
+});
+
 describe("session cookie", () => {
   it("is HttpOnly + Lax, and Secure in production or over HTTPS", () => {
     vi.stubEnv("NODE_ENV", "development");
@@ -56,5 +68,15 @@ describe("rate limiter", () => {
     expect(checkRateLimit(key, 3, 60_000).allowed).toBe(false);
     clearRateLimit(key);
     expect(checkRateLimit(key, 3, 60_000).allowed).toBe(true);
+  });
+
+  it("consumeRateLimit counts each allowed use and stops at the limit", () => {
+    const key = "test:consume";
+    clearRateLimit(key);
+    expect(consumeRateLimit(key, 2, 60_000).allowed).toBe(true);
+    expect(consumeRateLimit(key, 2, 60_000).allowed).toBe(true);
+    const blocked = consumeRateLimit(key, 2, 60_000);
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfterSec).toBeGreaterThan(0);
   });
 });

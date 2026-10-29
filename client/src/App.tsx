@@ -13,11 +13,13 @@ import Integrations from "./pages/Integrations";
 import Settings from "./pages/Settings";
 import Terms from "./pages/Terms";
 import Privacy from "./pages/Privacy";
+import ResetPassword from "./pages/ResetPassword";
 
 function Router() {
   return <Switch>
     <Route path="/terms" component={Terms} />
     <Route path="/privacy" component={Privacy} />
+    <Route path="/reset-password" component={ResetPassword} />
     <Route>
     <DashboardLayout>
     <Switch>

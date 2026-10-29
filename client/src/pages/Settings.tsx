@@ -1,3 +1,4 @@
+import { useAuth } from "@/_core/hooks/useAuth";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { EyeOff, KeyRound, LockKeyhole, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -46,7 +47,9 @@ function CredentialCard({ spec, configured, encryptionReady }: { spec: ProviderS
 }
 
 export default function Settings() {
+  const isAdmin = useAuth().user?.role === "admin";
   const statusQuery = trpc.settings.status.useQuery();
+  if (!isAdmin) return <div className="panel panel-inset"><h3 style={{ marginTop: 0 }}>Administrator only</h3><p className="source-note">Provider credentials can only be managed by the workspace administrator.</p></div>;
   const data = statusQuery.data;
   return <>
     <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-mark" />Admin controls</div><h2>Keep provider access in the backend.</h2><p>Credentials are submitted to the server, encrypted before database storage, and never returned to the browser.</p></div><div className="topbar-tag"><ShieldCheck size={14} color="#7cff6b" />Owner access only</div></div>
@@ -55,7 +58,7 @@ export default function Settings() {
     {data?.encryptionReady && <div className="notice success" style={{ marginBottom: 14 }}><strong><ShieldCheck size={14} style={{ verticalAlign: "-3px" }} /> Encryption is ready.</strong> Provider credentials are encrypted server-side. Replacing the encryption key without first re-encrypting saved values will make them unreadable.</div>}
     <section className="panel panel-inset" style={{ marginBottom: 14 }}>
       <div className="panel-title-line"><span className="panel-title-icon"><LockKeyhole size={15} /></span><h3 style={{ margin: 0, fontSize: 13 }}>Maps access is provided by the workspace</h3></div>
-      <p className="source-note" style={{ margin: "9px 0 0" }}>Google Maps Places requests use the project's server-side proxy. There is no separate Maps key field here. Google Custom Search is closed to new customers and scheduled to end on January 1, 2027; select SerpApi for a new Google-results connection. See <a className="text-link" href="https://developers.google.com/custom-search/v1/overview" target="_blank" rel="noreferrer">Google's official API notice</a>.</p>
+      <p className="source-note" style={{ margin: "9px 0 0" }}>Google Maps Places requests use the GOOGLE_MAPS_API_KEY set on the server. There is no Maps key field here. Google Custom Search is closed to new customers and scheduled to end on January 1, 2027; select SerpApi for a new Google-results connection. See <a className="text-link" href="https://developers.google.com/custom-search/v1/overview" target="_blank" rel="noreferrer">Google's official API notice</a>.</p>
     </section>
     <div className="credentials-grid">{providers.map((spec) => <CredentialCard key={spec.id} spec={spec} configured={data?.providers[spec.id] ?? false} encryptionReady={data?.encryptionReady ?? false} />)}</div>
     <div className="notice" style={{ marginTop: 14 }}><strong>Use only business contact data.</strong> Add provider credentials from the official provider accounts. Avoid patient records or sensitive health information. Email and phone checks describe provider-returned deliverability/number data and do not guarantee consent or reachability.</div>

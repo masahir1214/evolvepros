@@ -31,3 +31,10 @@ setInterval(() => {
     if (!bucket.hits.some((time) => time > cutoff)) buckets.delete(key);
   }
 }, 10 * 60 * 1000).unref();
+
+// Counts one use against the limit; returns allowed=false (without counting) once the window is full.
+export function consumeRateLimit(key: string, limit: number, windowMs: number): { allowed: boolean; retryAfterSec: number } {
+  const result = checkRateLimit(key, limit, windowMs);
+  if (result.allowed) recordFailure(key);
+  return result;
+}
